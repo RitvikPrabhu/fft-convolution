@@ -9,7 +9,7 @@ void swap(Complex *a, Complex *b) {
   *b = temp;
 }
 
-static void radix2_fft(Complex *x, size_t n, int inverse) {
+void radix2_fft(Complex *x, size_t n, int inverse) {
   size_t i, j, k, m;
 
   j = 0;
@@ -66,21 +66,36 @@ static void radix2_fft(Complex *x, size_t n, int inverse) {
   }
 }
 
-static void radix2_forward(Complex *data, size_t n) { radix2_fft(data, n, 0); }
+void radix2_forward(Complex *data, size_t n) { radix2_fft(data, n, 0); }
 
-static void radix2_inverse(Complex *data, size_t n) { radix2_fft(data, n, 1); }
+void radix2_inverse(Complex *data, size_t n) { radix2_fft(data, n, 1); }
 
 FFTInterface FFT_Radix2 = {.fft_forward = radix2_forward,
                            .fft_inverse = radix2_inverse};
 
+void print_complex_array(const char *label, Complex *data, size_t n) {
+  printf("%s:\n", label);
+  for (size_t i = 0; i < n; i++) {
+    printf("  [%zu]: %.3f + %.3fi\n", i, data[i].real, data[i].imag);
+  }
+  printf("\n");
+}
+
 int main(void) {
-  // Define FFT size (must be a power of 2).
   size_t n = 8;
 
   Complex input[8] = {{1, 0}, {2, 0}, {3, 0}, {4, 0},
-                      {0, 0}, {0, 0}, {0, 0}, {0, 0}};
+                      {5, 0}, {6, 0}, {7, 0}, {8, 0}};
+
+  print_complex_array("Original Input", input, n);
 
   FFTInterface *fftImpl = &FFT_Radix2;
+
+  fftImpl->fft_forward(input, n);
+  print_complex_array("After Forward FFT", input, n);
+
+  fftImpl->fft_inverse(input, n);
+  print_complex_array("After Inverse FFT (Recovered Data)", input, n);
 
   return 0;
 }

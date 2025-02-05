@@ -2,7 +2,6 @@
 #define FFT_INTERFACE_H
 
 #include <stddef.h>
-
 typedef struct {
   double real;
   double imag;
