@@ -13,7 +13,6 @@ typedef struct {
 
   void (*fft_inverse)(Complex *data, size_t n);
 
-  void (*fft_init)(size_t n);
 } FFTInterface;
 
 #endif
