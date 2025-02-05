@@ -10,10 +10,9 @@ void swap(Complex *a, Complex *b) {
 }
 
 void radix2_fft(Complex *x, size_t n, int inverse) {
-  size_t i, j, k, m;
 
-  j = 0;
-  for (i = 1; i < n; i++) {
+  int j = 0;
+  for (int i = 1; i < n; i++) {
     size_t bit = n >> 1;
     while (j >= bit) {
       j -= bit;
@@ -24,7 +23,7 @@ void radix2_fft(Complex *x, size_t n, int inverse) {
       swap(&x[i], &x[j]);
   }
 
-  for (m = 2; m <= n; m <<= 1) {
+  for (int m = 2; m <= n; m *= 2) {
     double angle = 2 * M_PI / m * (inverse ? 1 : -1);
     Complex wm;
     wm.real = cos(angle);
@@ -35,7 +34,7 @@ void radix2_fft(Complex *x, size_t n, int inverse) {
       Complex w;
       w.real = 1.0;
       w.imag = 0.0;
-      for (k = 0; k < m / 2; k++) {
+      for (int k = 0; k < m / 2; k++) {
         Complex t, u;
         // t = w * x[j + k + m/2]
         t.real =
@@ -59,7 +58,7 @@ void radix2_fft(Complex *x, size_t n, int inverse) {
   }
 
   if (inverse) {
-    for (i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++) {
       x[i].real /= n;
       x[i].imag /= n;
     }
