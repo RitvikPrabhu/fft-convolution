@@ -1,151 +1,182 @@
-#include <CL/cl.h>
+/*  - For large N, you must check device constraints.
+ *  - Only works when N is a power of two.
+ *  - The code here is minimal and omits some error checks for brevity.*/
+
+#include <OpenCL/cl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define CHECK_ERROR(err)                                                       \
-  if (err != CL_SUCCESS) {                                                     \
-    printf("OpenCL Error: %d\n", err);                                         \
-    exit(1);                                                                   \
+static const int N = 8;
+static const int BATCH_COUNT = 1;
+
+#define CHECK_ERROR(err, msg)                                                  \
+  if ((err) != CL_SUCCESS) {                                                   \
+    fprintf(stderr, "OpenCL Error %d at %s\n", (err), (msg));                  \
+    exit(EXIT_FAILURE);                                                        \
   }
 
-char *readKernelSource(const char *filename) {
-  FILE *fp = fopen(filename, "r");
+int main(int argc, char *argv[]) {
+
+  cl_device_type desiredDeviceType = CL_DEVICE_TYPE_GPU;
+  if (argc > 1 && strcmp(argv[1], "CPU") == 0) {
+    desiredDeviceType = CL_DEVICE_TYPE_CPU;
+  }
+
+  int n = N;
+  int batchCount = BATCH_COUNT;
+  size_t totalSamples = (size_t)N * (size_t)BATCH_COUNT;
+  cl_float2 *hostInput = (cl_float2 *)malloc(sizeof(cl_float2) * totalSamples);
+  cl_float2 *hostOutput = (cl_float2 *)malloc(sizeof(cl_float2) * totalSamples);
+
+  for (size_t i = 0; i < totalSamples; i++) {
+    hostInput[i].s[0] = (float)(i + 1);
+    hostInput[i].s[1] = 0.0f;
+  }
+
+  int inverseFFT = 0;
+
+  cl_int err = 0;
+  cl_uint numPlatforms = 0;
+  cl_uint numDevices = 0;
+
+  err = clGetPlatformIDs(0, NULL, &numPlatforms);
+  CHECK_ERROR(err, "clGetPlatformIDs (count)");
+  if (numPlatforms == 0) {
+    fprintf(stderr, "No OpenCL platform found!\n");
+    return 1;
+  }
+  cl_platform_id *platforms =
+      (cl_platform_id *)malloc(sizeof(cl_platform_id) * numPlatforms);
+  err = clGetPlatformIDs(numPlatforms, platforms, NULL);
+  CHECK_ERROR(err, "clGetPlatformIDs (list)");
+
+  cl_platform_id chosenPlatform = platforms[0];
+  free(platforms);
+
+  err = clGetDeviceIDs(chosenPlatform, desiredDeviceType, 0, NULL, &numDevices);
+  if (err != CL_SUCCESS || numDevices == 0) {
+    fprintf(stderr,
+            "No device of the requested type found. Falling back to CPU...\n");
+    desiredDeviceType = CL_DEVICE_TYPE_CPU;
+    err =
+        clGetDeviceIDs(chosenPlatform, desiredDeviceType, 0, NULL, &numDevices);
+    CHECK_ERROR(err, "clGetDeviceIDs (CPU fallback)");
+  }
+
+  cl_device_id *devices =
+      (cl_device_id *)malloc(sizeof(cl_device_id) * numDevices);
+  err = clGetDeviceIDs(chosenPlatform, CL_DEVICE_TYPE_ALL, numDevices, devices,
+                       NULL);
+  CHECK_ERROR(err, "clGetDeviceIDs (list)");
+  cl_device_id chosenDevice = devices[0];
+  free(devices);
+
+  cl_context context =
+      clCreateContext(NULL, 1, &chosenDevice, NULL, NULL, &err);
+  CHECK_ERROR(err, "clCreateContext");
+
+  cl_command_queue queue = clCreateCommandQueue(context, chosenDevice, 0, &err);
+  CHECK_ERROR(err, "clCreateCommandQueue");
+
+  FILE *fp = fopen("batched_fft.cl", "r");
   if (!fp) {
-    fprintf(stderr, "Failed to load kernel file: %s\n", filename);
-    exit(1);
+    fprintf(stderr, "Failed to open batched_fft.cl\n");
+    return 1;
   }
   fseek(fp, 0, SEEK_END);
-  size_t size = ftell(fp);
+  long fileSize = ftell(fp);
   rewind(fp);
-  char *source = (char *)malloc(size + 1);
-  fread(source, 1, size, fp);
-  source[size] = '\0';
+  char *kernelSource = (char *)malloc(fileSize + 1);
+  fread(kernelSource, 1, fileSize, fp);
+  kernelSource[fileSize] = '\0';
   fclose(fp);
-  return source;
-}
 
-void computeBitReversalIndices(int *bit_rev, int n) {
-  int num_bits = 0;
-  int temp = n;
-  while (temp > 1) {
-    num_bits++;
-    temp >>= 1;
-  }
-  for (int i = 0; i < n; i++) {
-    int j = 0;
-    for (int k = 0; k < num_bits; k++) {
-      if (i & (1 << k))
-        j |= 1 << (num_bits - 1 - k);
-    }
-    bit_rev[i] = j;
-  }
-}
+  cl_program program = clCreateProgramWithSource(
+      context, 1, (const char **)&kernelSource, NULL, &err);
+  CHECK_ERROR(err, "clCreateProgramWithSource");
 
-int main(void) {
-  const int n = 8;
-
-  double data[2 * n] = {1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0,
-                        5.0, 0.0, 6.0, 0.0, 7.0, 0.0, 8.0, 0.0};
-
-  int *bit_rev = (int *)malloc(n * sizeof(int));
-  computeBitReversalIndices(bit_rev, n);
-
-  cl_int err;
-  cl_platform_id platform;
-  err = clGetPlatformIDs(1, &platform, NULL);
-  CHECK_ERROR(err);
-
-  cl_device_id device;
-  err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL);
-  CHECK_ERROR(err);
-
-  cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
-  CHECK_ERROR(err);
-  cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
-  CHECK_ERROR(err);
-
-  char *source = readKernelSource("fft_kernel.cl");
-
-  cl_program program =
-      clCreateProgramWithSource(context, 1, (const char **)&source, NULL, &err);
-  CHECK_ERROR(err);
-  err = clBuildProgram(program, 1, &device, "-cl-std=CL1.2 -cl-khr-fp64", NULL,
-                       NULL);
+  err = clBuildProgram(program, 1, &chosenDevice, NULL, NULL, NULL);
   if (err != CL_SUCCESS) {
-    size_t log_size;
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL,
-                          &log_size);
-    char *log = (char *)malloc(log_size);
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log,
-                          NULL);
-    printf("Build Log:\n%s\n", log);
-    free(log);
-    exit(1);
+    size_t logSize = 0;
+    clGetProgramBuildInfo(program, chosenDevice, CL_PROGRAM_BUILD_LOG, 0, NULL,
+                          &logSize);
+    char *buildLog = (char *)malloc(logSize);
+    clGetProgramBuildInfo(program, chosenDevice, CL_PROGRAM_BUILD_LOG, logSize,
+                          buildLog, NULL);
+    fprintf(stderr, "Build Log:\n%s\n", buildLog);
+    free(buildLog);
+    CHECK_ERROR(err, "clBuildProgram");
   }
 
-  cl_kernel kernelBitRev = clCreateKernel(program, "bit_reverse", &err);
-  CHECK_ERROR(err);
-  cl_kernel kernelFftStage = clCreateKernel(program, "fft_stage", &err);
-  CHECK_ERROR(err);
+  cl_kernel kernel = clCreateKernel(program, "batched_radix2_fft", &err);
+  CHECK_ERROR(err, "clCreateKernel");
 
-  cl_mem bufData =
+  cl_mem inputBuffer =
       clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
-                     sizeof(double) * 2 * n, data, &err);
-  CHECK_ERROR(err);
-  cl_mem bufBitRev =
-      clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                     sizeof(int) * n, bit_rev, &err);
-  CHECK_ERROR(err);
+                     sizeof(cl_float2) * totalSamples, hostInput, &err);
+  CHECK_ERROR(err, "clCreateBuffer (input)");
 
-  err = clSetKernelArg(kernelBitRev, 0, sizeof(cl_mem), &bufData);
-  CHECK_ERROR(err);
-  err = clSetKernelArg(kernelBitRev, 1, sizeof(cl_mem), &bufBitRev);
-  CHECK_ERROR(err);
-  err = clSetKernelArg(kernelBitRev, 2, sizeof(int), &n);
-  CHECK_ERROR(err);
+  cl_mem outputBuffer = clCreateBuffer(
+      context, CL_MEM_READ_WRITE, sizeof(cl_float2) * totalSamples, NULL, &err);
+  CHECK_ERROR(err, "clCreateBuffer (output)");
 
-  size_t globalSize = n;
-  err = clEnqueueNDRangeKernel(queue, kernelBitRev, 1, NULL, &globalSize, NULL,
-                               0, NULL, NULL);
-  CHECK_ERROR(err);
+  err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &inputBuffer);
+  err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &outputBuffer);
+  err |= clSetKernelArg(kernel, 2, sizeof(int), &n);
+  err |= clSetKernelArg(kernel, 3, sizeof(int), &batchCount);
+  err |= clSetKernelArg(kernel, 4, sizeof(int), &inverseFFT);
+  CHECK_ERROR(err, "clSetKernelArg");
+
+  size_t globalSize = (size_t)BATCH_COUNT * (size_t)N;
+  size_t localSize = (size_t)N;
+
+  size_t maxWorkGroupSize;
+  err = clGetDeviceInfo(chosenDevice, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                        sizeof(size_t), &maxWorkGroupSize, NULL);
+  CHECK_ERROR(err, "clGetDeviceInfo (CL_DEVICE_MAX_WORK_GROUP_SIZE)");
+  if (localSize > maxWorkGroupSize) {
+    fprintf(stderr, "ERROR: Chosen localSize %zu > device's max %zu.\n",
+            localSize, maxWorkGroupSize);
+    fprintf(stderr,
+            "Either reduce N or use a more advanced tiling approach.\n");
+    exit(EXIT_FAILURE);
+  }
+
+  err = clEnqueueNDRangeKernel(queue, kernel,
+                               1,    // 1-dimensional range
+                               NULL, // global offset
+                               &globalSize, &localSize, 0, NULL, NULL);
+  CHECK_ERROR(err, "clEnqueueNDRangeKernel");
+
   clFinish(queue);
 
-  for (int m = 2; m <= n; m *= 2) {
-    int inverse = 0;
-    err = clSetKernelArg(kernelFftStage, 0, sizeof(cl_mem), &bufData);
-    CHECK_ERROR(err);
-    err = clSetKernelArg(kernelFftStage, 1, sizeof(int), &m);
-    CHECK_ERROR(err);
-    err = clSetKernelArg(kernelFftStage, 2, sizeof(int), &inverse);
-    CHECK_ERROR(err);
+  err = clEnqueueReadBuffer(queue, outputBuffer, CL_TRUE, 0,
+                            sizeof(cl_float2) * totalSamples, hostOutput, 0,
+                            NULL, NULL);
+  CHECK_ERROR(err, "clEnqueueReadBuffer");
 
-    globalSize = n / 2;
-    err = clEnqueueNDRangeKernel(queue, kernelFftStage, 1, NULL, &globalSize,
-                                 NULL, 0, NULL, NULL);
-    CHECK_ERROR(err);
-    clFinish(queue);
+  for (int b = 0; b < BATCH_COUNT; b++) {
+    printf("=== Batch %d ===\n", b);
+    for (int i = 0; i < N; i++) {
+      int index = b * N + i;
+      printf("  idx=%d => (%f, %f)\n", i,
+             hostOutput[index].s[0],  // real
+             hostOutput[index].s[1]); // imag
+    }
   }
 
-  double result[2 * n];
-  err = clEnqueueReadBuffer(queue, bufData, CL_TRUE, 0, sizeof(double) * 2 * n,
-                            result, 0, NULL, NULL);
-  CHECK_ERROR(err);
+  free(hostInput);
+  free(hostOutput);
 
-  printf("FFT Result:\n");
-  for (int i = 0; i < n; i++) {
-    printf("[%d]: %f + %fi\n", i, result[2 * i], result[2 * i + 1]);
-  }
-
-  clReleaseMemObject(bufData);
-  clReleaseMemObject(bufBitRev);
-  clReleaseKernel(kernelBitRev);
-  clReleaseKernel(kernelFftStage);
+  clReleaseMemObject(inputBuffer);
+  clReleaseMemObject(outputBuffer);
+  clReleaseKernel(kernel);
   clReleaseProgram(program);
   clReleaseCommandQueue(queue);
   clReleaseContext(context);
-  free(source);
-  free(bit_rev);
 
+  printf("Done.\n");
   return 0;
 }
