@@ -16,7 +16,7 @@ __kernel void batched_radix2_fft(
         return;
     }
 
-    __local float2 buffer[8192];
+    __local float2 buffer[8];
 
     float2 val = input[base + localId];
     buffer[localId] = val;
