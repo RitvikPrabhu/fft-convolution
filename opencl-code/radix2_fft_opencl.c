@@ -1,8 +1,5 @@
-/*  - For large N, you must check device constraints.
- *  - Only works when N is a power of two.
- *  - The code here is minimal and omits some error checks for brevity.*/
-
-#include <OpenCL/cl.h>
+#define CL_TARGET_OPENCL_VERSION 120
+#include <CL/cl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
