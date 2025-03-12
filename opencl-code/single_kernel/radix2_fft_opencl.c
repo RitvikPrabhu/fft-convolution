@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const int N = 8;
+static const int N = 8192;
 static const int BATCH_COUNT = 1;
 
 #define CHECK_ERROR(err, msg)                                                  \
@@ -20,6 +20,8 @@ int main(int argc, char *argv[]) {
   if (argc > 1 && strcmp(argv[1], "CPU") == 0) {
     desiredDeviceType = CL_DEVICE_TYPE_CPU;
   }
+
+  // printf("Max Work Group Size exceeded: %d\n", CL_DEVICE_MAX_WORK_GROUP_SIZE);
 
   int n = N;
   int batchCount = BATCH_COUNT;
@@ -74,7 +76,7 @@ int main(int argc, char *argv[]) {
       clCreateContext(NULL, 1, &chosenDevice, NULL, NULL, &err);
   CHECK_ERROR(err, "clCreateContext");
 
-  cl_command_queue queue = clCreateCommandQueue(context, chosenDevice, 0, &err);
+  cl_command_queue queue = clCreateCommandQueue(context, chosenDevice, CL_QUEUE_PROFILING_ENABLE, &err);
   CHECK_ERROR(err, "clCreateCommandQueue");
 
   FILE *fp = fopen("batched_fft.cl", "r");
@@ -140,15 +142,23 @@ int main(int argc, char *argv[]) {
             "Either reduce N or use a more advanced tiling approach.\n");
     exit(EXIT_FAILURE);
   }
-
+  cl_event kernel_event;
   err = clEnqueueNDRangeKernel(queue, kernel,
                                1,    // 1-dimensional range
                                NULL, // global offset
-                               &globalSize, &localSize, 0, NULL, NULL);
+                               &globalSize, &localSize, 0, NULL, &kernel_event);
   CHECK_ERROR(err, "clEnqueueNDRangeKernel");
 
   clFinish(queue);
 
+  cl_ulong time_start, time_end;
+  err = clGetEventProfilingInfo(kernel_event, CL_PROFILING_COMMAND_START, sizeof(time_start), &time_start, NULL);
+  CHECK_ERROR(err, "clGetEventProfilingInfo (start)");
+  err = clGetEventProfilingInfo(kernel_event, CL_PROFILING_COMMAND_END, sizeof(time_end), &time_end, NULL);
+  CHECK_ERROR(err, "clGetEventProfilingInfo (end)");
+  double nanoSeconds = time_end - time_start;
+  printf("Kernel execution time: %0.3f milliseconds\n", nanoSeconds / 1e6);
+  
   err = clEnqueueReadBuffer(queue, outputBuffer, CL_TRUE, 0,
                             sizeof(cl_float2) * totalSamples, hostOutput, 0,
                             NULL, NULL);

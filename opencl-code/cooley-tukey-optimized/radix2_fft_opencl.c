@@ -6,25 +6,19 @@
 #include <string.h>
 
 static const int N_VALUE = 8192;
+
 #define CHECK_CL_ERR(err, msg) \
     if ((err) != CL_SUCCESS) { \
-        fprintf(stderr, "OpenCL error %d at %s\n", (int)err, msg); \
+        fprintf(stderr, "OpenCL error %d at %s\n", (int)(err), (msg)); \
         exit(EXIT_FAILURE);     \
     }
 
-static void print_data(const char* title, cl_float2* data, int N) {
-    printf("%s:\n", title);
-    for (int i = 0; i < N; i++) {
-        printf("  [%d] => (%f, %f)\n", i, data[i].s[0], data[i].s[1]);
-    }
-}
-
 static int get_log2(int N) {
     int logN = 0;
-    int temp = N;
-    while (temp > 1) {
-        if (temp % 2 != 0) return -1;
-        temp >>= 1;
+    int tmp = N;
+    while (tmp > 1) {
+        if (tmp % 2 != 0) return -1; 
+        tmp >>= 1;
         logN++;
     }
     return logN;
@@ -32,11 +26,12 @@ static int get_log2(int N) {
 
 int main(int argc, char* argv[])
 {
-	cl_device_type desiredDeviceType = CL_DEVICE_TYPE_GPU;
-	if (argc > 1 && strcmp(argv[1], "CPU") == 0) {
-		desiredDeviceType = CL_DEVICE_TYPE_CPU;
-	}
-    int N = N_VALUE; 
+    cl_device_type desiredDeviceType = CL_DEVICE_TYPE_GPU;
+    if (argc > 1 && strcmp(argv[1], "CPU") == 0) {
+        desiredDeviceType = CL_DEVICE_TYPE_CPU;
+    }
+
+    int N = N_VALUE;
     int inverseFFT = 0;
 
     int logN = get_log2(N);
@@ -45,6 +40,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // Host buffers
     cl_float2* hostInput  = (cl_float2*)malloc(sizeof(cl_float2)*N);
     cl_float2* hostOutput = (cl_float2*)malloc(sizeof(cl_float2)*N);
 
@@ -56,7 +52,7 @@ int main(int argc, char* argv[])
     cl_int err;
     cl_uint numPlatforms = 0;
     err = clGetPlatformIDs(0, NULL, &numPlatforms);
-    CHECK_CL_ERR(err, "clGetPlatformIDs");
+    CHECK_CL_ERR(err, "clGetPlatformIDs(count)");
     if (numPlatforms == 0) {
         fprintf(stderr, "No OpenCL platform found.\n");
         return 1;
@@ -66,24 +62,38 @@ int main(int argc, char* argv[])
     CHECK_CL_ERR(err, "clGetPlatformIDs(1)");
 
     cl_device_id device;
-    cl_uint numDevices = 0;
+    cl_uint numDevices=0;
     err = clGetDeviceIDs(platform, desiredDeviceType, 1, &device, &numDevices);
     if (err != CL_SUCCESS || numDevices == 0) {
         printf("No device of the requested type found. Falling back to CPU...\n");
         err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, &numDevices);
-        CHECK_CL_ERR(err, "clGetDeviceIDs(CPU)");
+        CHECK_CL_ERR(err, "clGetDeviceIDs(CPU fallback)");
     }
 
     cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
     CHECK_CL_ERR(err, "clCreateContext");
 
+    // Create a profiling-enabled command queue.
     cl_command_queue queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
     CHECK_CL_ERR(err, "clCreateCommandQueue");
 
+    int halfN = N/2;
+    cl_float2* hostTwiddles = (cl_float2*)malloc(sizeof(cl_float2)*halfN);
+    for (int k = 0; k < halfN; k++) {
+        float angle = 2.0f * (float)M_PI * (float)k / (float)N;
+        hostTwiddles[k].s[0] = cosf(angle);
+        hostTwiddles[k].s[1] = sinf(angle);
+    }
+
+    cl_mem twiddleBuf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       sizeof(cl_float2)*halfN, hostTwiddles, &err);
+    CHECK_CL_ERR(err, "clCreateBuffer(twiddleBuf)");
+    free(hostTwiddles);
+
     FILE* fp = fopen("batched_fft.cl", "r");
     if (!fp) {
-        fprintf(stderr, "Could not open batched_fft_multi_pass.cl\n");
-        exit(1);
+        fprintf(stderr, "Could not open batched_fft.cl\n");
+        return 1;
     }
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
@@ -93,12 +103,12 @@ int main(int argc, char* argv[])
     kernelSrc[fsize] = '\0';
     fclose(fp);
 
-    cl_program program = clCreateProgramWithSource(context, 1, 
-                                (const char**)&kernelSrc, NULL, &err);
+    cl_program program = clCreateProgramWithSource(context, 1, (const char**)&kernelSrc, NULL, &err);
     CHECK_CL_ERR(err, "clCreateProgramWithSource");
     free(kernelSrc);
 
-    err = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    const char* buildOptions = "-cl-fast-relaxed-math -cl-mad-enable";
+    err = clBuildProgram(program, 1, &device, buildOptions, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t logSize=0;
         clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
@@ -110,25 +120,27 @@ int main(int argc, char* argv[])
         CHECK_CL_ERR(err, "clBuildProgram");
     }
 
-    cl_kernel krnBitReverse  = clCreateKernel(program, "bit_reverse_kernel", &err);
+    cl_kernel krnBitReverse = clCreateKernel(program, "bit_reverse_kernel", &err);
     CHECK_CL_ERR(err, "clCreateKernel(bit_reverse_kernel)");
-    cl_kernel krnFFTStage    = clCreateKernel(program, "fft_stage_kernel", &err);
-    CHECK_CL_ERR(err, "clCreateKernel(fft_stage_kernel)");
-    cl_kernel krnFinalScale  = clCreateKernel(program, "final_scale_kernel", &err);
+
+    cl_kernel krnTwoStages = clCreateKernel(program, "two_stages_fft_kernel", &err);
+    CHECK_CL_ERR(err, "clCreateKernel(two_stages_fft_kernel)");
+
+    cl_kernel krnFinalScale = clCreateKernel(program, "final_scale_kernel", &err);
     CHECK_CL_ERR(err, "clCreateKernel(final_scale_kernel)");
 
-    cl_mem bufA = clCreateBuffer(context, CL_MEM_READ_WRITE,
-                                 sizeof(cl_float2)*N, NULL, &err);
+    cl_mem bufA = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                 sizeof(cl_float2)*N, hostInput, &err);
     CHECK_CL_ERR(err, "clCreateBuffer(bufA)");
+
     cl_mem bufB = clCreateBuffer(context, CL_MEM_READ_WRITE,
                                  sizeof(cl_float2)*N, NULL, &err);
     CHECK_CL_ERR(err, "clCreateBuffer(bufB)");
 
-    err = clEnqueueWriteBuffer(queue, bufA, CL_TRUE, 0,
-                               sizeof(cl_float2)*N,
-                               hostInput, 0, NULL, NULL);
-    CHECK_CL_ERR(err, "clEnqueueWriteBuffer(bufA)");
+    // Variable to accumulate total kernel execution time (in ms)
     double total_kernel_time = 0.0;
+
+    // bit_reverse_kernel invocation
     {
         err  = clSetKernelArg(krnBitReverse, 0, sizeof(cl_mem), &bufA);
         err |= clSetKernelArg(krnBitReverse, 1, sizeof(cl_mem), &bufB);
@@ -136,13 +148,13 @@ int main(int argc, char* argv[])
         CHECK_CL_ERR(err, "clSetKernelArg(bit_reverse_kernel)");
 
         size_t globalSize = N;
+        size_t localSize = (N < 128) ? N : 128;
         cl_event event_bit_reverse;
         err = clEnqueueNDRangeKernel(queue, krnBitReverse,
                                      1, NULL,
-                                     &globalSize, NULL,
+                                     &globalSize, &localSize,
                                      0, NULL, &event_bit_reverse);
         CHECK_CL_ERR(err, "clEnqueueNDRangeKernel(bit_reverse_kernel)");
-
         clFinish(queue);
         cl_ulong start, end;
         err = clGetEventProfilingInfo(event_bit_reverse, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
@@ -153,87 +165,94 @@ int main(int argc, char* argv[])
         clReleaseEvent(event_bit_reverse);
     }
 
-    cl_mem readBuf  = bufB;  
-    cl_mem writeBuf = bufA; 
+    cl_mem readBuf = bufB;
+    cl_mem writeBuf = bufA;
 
-    for (int s = 0; s < logN; s++) {
-        err  = clSetKernelArg(krnFFTStage, 0, sizeof(cl_mem), &readBuf);
-        err |= clSetKernelArg(krnFFTStage, 1, sizeof(cl_mem), &writeBuf);
-        err |= clSetKernelArg(krnFFTStage, 2, sizeof(int),     &N);
-        err |= clSetKernelArg(krnFFTStage, 3, sizeof(int),     &s);
-        err |= clSetKernelArg(krnFFTStage, 4, sizeof(int),     &inverseFFT);
-        CHECK_CL_ERR(err, "clSetKernelArg(fft_stage_kernel)");
+    // two_stages_fft_kernel invocations
+    for (int s = 0; s < logN; s += 2) {
+        int numStages = 2;
+        if (s + 1 >= logN) {
+            numStages = 1;
+        }
 
-        size_t globalSize = (size_t)(N/2);
-        cl_event event_fft_stage;
-        err = clEnqueueNDRangeKernel(queue, krnFFTStage,
-                                     1, NULL, &globalSize, NULL,
-                                     0, NULL, &event_fft_stage);
-        CHECK_CL_ERR(err, "clEnqueueNDRangeKernel(fft_stage_kernel)");
+        err  = clSetKernelArg(krnTwoStages, 0, sizeof(cl_mem), &readBuf);
+        err |= clSetKernelArg(krnTwoStages, 1, sizeof(cl_mem), &writeBuf);
+        err |= clSetKernelArg(krnTwoStages, 2, sizeof(int),     &N);
+        err |= clSetKernelArg(krnTwoStages, 3, sizeof(int),     &s);            
+        err |= clSetKernelArg(krnTwoStages, 4, sizeof(int),     &numStages);   
+        err |= clSetKernelArg(krnTwoStages, 5, sizeof(int),     &inverseFFT);
+        err |= clSetKernelArg(krnTwoStages, 6, sizeof(cl_mem),  &twiddleBuf);
+        CHECK_CL_ERR(err, "clSetKernelArg(two_stages_fft_kernel)");
 
+        size_t globalSizeStage = N/2;
+        size_t localSizeStage = (globalSizeStage < 128) ? globalSizeStage : 128;
+        cl_event event_two_stages;
+        err = clEnqueueNDRangeKernel(queue, krnTwoStages,
+                                     1, NULL,
+                                     &globalSizeStage, &localSizeStage,
+                                     0, NULL, &event_two_stages);
+        CHECK_CL_ERR(err, "clEnqueueNDRangeKernel(two_stages_fft_kernel)");
         clFinish(queue);
         cl_ulong start, end;
-        err = clGetEventProfilingInfo(event_fft_stage, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
-        CHECK_CL_ERR(err, "clGetEventProfilingInfo(fft_stage start)");
-        err = clGetEventProfilingInfo(event_fft_stage, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
-        CHECK_CL_ERR(err, "clGetEventProfilingInfo(fft_stage end)");
-        total_kernel_time += (double)(end - start) / 1e6; // add ms
-        clReleaseEvent(event_fft_stage);
+        err = clGetEventProfilingInfo(event_two_stages, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
+        CHECK_CL_ERR(err, "clGetEventProfilingInfo(two_stages start)");
+        err = clGetEventProfilingInfo(event_two_stages, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
+        CHECK_CL_ERR(err, "clGetEventProfilingInfo(two_stages end)");
+        total_kernel_time += (double)(end - start) / 1e6;
+        clReleaseEvent(event_two_stages);
 
-        cl_mem temp = readBuf;
-        readBuf  = writeBuf;
-        writeBuf = temp;
+        cl_mem tmp = readBuf;
+        readBuf = writeBuf;
+        writeBuf = tmp;
     }
 
+    // final_scale_kernel invocation (if inverseFFT)
     if (inverseFFT) {
         err  = clSetKernelArg(krnFinalScale, 0, sizeof(cl_mem), &readBuf);
         err |= clSetKernelArg(krnFinalScale, 1, sizeof(int),     &N);
         CHECK_CL_ERR(err, "clSetKernelArg(final_scale_kernel)");
 
-        size_t globalSize = N;
+        size_t finalGlobalSize = N;
         cl_event event_final_scale;
         err = clEnqueueNDRangeKernel(queue, krnFinalScale,
-                                     1, NULL, &globalSize, NULL,
+                                     1, NULL,
+                                     &finalGlobalSize, NULL,
                                      0, NULL, &event_final_scale);
         CHECK_CL_ERR(err, "clEnqueueNDRangeKernel(final_scale_kernel)");
-        
         clFinish(queue);
         cl_ulong start, end;
         err = clGetEventProfilingInfo(event_final_scale, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
         CHECK_CL_ERR(err, "clGetEventProfilingInfo(final_scale start)");
         err = clGetEventProfilingInfo(event_final_scale, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
         CHECK_CL_ERR(err, "clGetEventProfilingInfo(final_scale end)");
-        total_kernel_time += (double)(end - start) / 1e6; // add ms
+        total_kernel_time += (double)(end - start) / 1e6;
         clReleaseEvent(event_final_scale);
     }
 
     err = clEnqueueReadBuffer(queue, readBuf, CL_TRUE, 0,
-                              sizeof(cl_float2)*N,
-                              hostOutput, 0, NULL, NULL);
-    CHECK_CL_ERR(err, "clEnqueueReadBuffer(finalResult)");
+                              sizeof(cl_float2)*N, hostOutput,
+                              0, NULL, NULL);
+    CHECK_CL_ERR(err, "clEnqueueReadBuffer(final)");
 
     clFinish(queue);
 
-    printf("\nFFT Result (first 8 samples) [inverse=%d, N=%d]:\n", inverseFFT, N);
-    for(int i=0; i<8; i++) {
-        printf("  idx=%d => (%f, %f)\n", i,
-               hostOutput[i].s[0],
-               hostOutput[i].s[1]);
+    printf("\nFFT Result (first 8) [N=%d, inverse=%d]:\n", N, inverseFFT);
+    for(int i = 0; i < 8; i++){
+        printf("  idx=%d => (%f, %f)\n", i, hostOutput[i].s[0], hostOutput[i].s[1]);
     }
 
+    // Print the total kernel execution time (in ms)
     printf("Total kernel execution time: %0.3f ms\n", total_kernel_time);
 
-
+    // Cleanup
     free(hostInput);
     free(hostOutput);
-
     clReleaseMemObject(bufA);
     clReleaseMemObject(bufB);
-
+    clReleaseMemObject(twiddleBuf);
     clReleaseKernel(krnBitReverse);
-    clReleaseKernel(krnFFTStage);
+    clReleaseKernel(krnTwoStages);
     clReleaseKernel(krnFinalScale);
-
     clReleaseProgram(program);
     clReleaseCommandQueue(queue);
     clReleaseContext(context);
@@ -241,4 +260,3 @@ int main(int argc, char* argv[])
     printf("\nDone.\n");
     return 0;
 }
-
