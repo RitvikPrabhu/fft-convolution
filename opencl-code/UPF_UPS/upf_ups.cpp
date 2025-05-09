@@ -11,27 +11,18 @@
 #include <iostream>
 #include <vector>
 
-/* ------------------------------------------------------------------
- *  Uniform‑Partitioned (time‑domain) block convolution.
- *  Minimal changes from the original example:
- *    • Block size B is set equal to the partition length L.
- *    • FIR_LEN is now a multiple of L (4× here).
- *    • A sixth kernel argument selects filter partition and ring offset.
- *    • The host loops over the P partitions and accumulates their outputs.
- * ------------------------------------------------------------------*/
-
-constexpr unsigned N_SAMPLES = 8192;     // input length
-constexpr unsigned L         = 256;      // partition (= block) length
-constexpr unsigned FIR_LEN   = 1024;     // total FIR length (must be k·L)
-constexpr unsigned P         = FIR_LEN / L;   // partition count (4)
-constexpr unsigned B         = L;        // processing block = partition size
+constexpr unsigned N_SAMPLES = 8192;     
+constexpr unsigned L         = 256;    
+constexpr unsigned FIR_LEN   = 1024;    
+constexpr unsigned P         = FIR_LEN / L;   
+constexpr unsigned B         = L;       
 
 static_assert(FIR_LEN % L == 0);
 static_assert(N_SAMPLES  % B == 0);
 
-constexpr unsigned BLKS_IN   = N_SAMPLES / B;              // 32 blocks of real audio
+constexpr unsigned BLKS_IN   = N_SAMPLES / B;              
 constexpr unsigned OUT_LEN   = N_SAMPLES + FIR_LEN - 1;
-constexpr unsigned RING_SAMPLES = (P + 1)*L - 1;           // ring holds P old blocks + overlap
+constexpr unsigned RING_SAMPLES = (P + 1)*L - 1;           
 
 static inline double now_ns()
 {
@@ -76,19 +67,19 @@ static void refConv(const std::vector<double>& x,
     }
 }
 
-/* ---------- GPU kernel -------------------------------------------------- */
+
 static const char* kSrc = R"CLC(
 __kernel void upfUps(__global const float* ring,
                      __global const float* Hrev,
-                     __global       float* out,
-                     const uint            Ltap,
-                     const uint            partIdx,
-                     const uint            base)
+                     __global float* out,
+                     const uint Ltap,
+                     const uint partIdx,
+                     const uint base)
 {
     const uint gid = get_global_id(0);
     float acc = 0.0f;
     #pragma unroll
-    for (uint k = 0; k < Ltap; ++k)
+    for (uint k = 0; k < Ltap; k++)
         acc += ring[base + gid + k] * Hrev[partIdx*Ltap + k];
     out[gid] = acc;
 }
@@ -96,22 +87,22 @@ __kernel void upfUps(__global const float* ring,
 
 int main()
 {
-    /* ------------ test input and filter ------------------------------- */
+    
     std::vector<float> x(N_SAMPLES);
     for(unsigned n=0;n<N_SAMPLES;n++)
-        x[n]=sinf(2.0f*M_PI*100.0f*n/N_SAMPLES);   // 100‑Hz tone
+        x[n]=sinf(2.0f*M_PI*100.0f*n/N_SAMPLES);   
     dump("input.bin",x);
 
     std::vector<float> h(FIR_LEN);  hannLPF(h,500.0f/8192.0f);
     dump("fir.bin",h);
 
-    /* pre‑reverse every partition */
+    
     std::vector<float> hrev(FIR_LEN);
     for(unsigned p=0;p<P;p++)
         for(unsigned k=0;k<L;k++)
             hrev[p*L+k] = h[p*L + (L-1-k)];
 
-    /* ----------- OpenCL setup ----------------------------------------- */
+    
     cl_int err; cl_platform_id plat; cl_device_id dev;
     clGetPlatformIDs(1,&plat,nullptr);
     clGetDeviceIDs(plat,CL_DEVICE_TYPE_DEFAULT,1,&dev,nullptr);
@@ -123,7 +114,6 @@ int main()
     clBuildProgram(pr,1,&dev,"",nullptr,nullptr);
     cl_kernel  kn=clCreateKernel(pr,"upfUps",&err);
 
-    /* device buffers */
     const size_t ringBytes = RING_SAMPLES*sizeof(float);
     cl_mem dRing=clCreateBuffer(ctx,CL_MEM_READ_ONLY ,ringBytes,nullptr,&err);
     cl_mem dH   =clCreateBuffer(ctx,CL_MEM_READ_ONLY ,FIR_LEN*sizeof(float),nullptr,&err);
@@ -133,25 +123,25 @@ int main()
 
     const cl_uint Ltap=L;  clSetKernelArg(kn,3,sizeof(Ltap),&Ltap);
 
-    /* ------------ processing state ------------------------------------ */
+    
     std::vector<float> ring(RING_SAMPLES,0.0f);
     std::vector<float> yGPU(OUT_LEN,0.0f);
-    std::vector<float> blockOut(B);   // full block accumulation
+    std::vector<float> blockOut(B);   
     std::vector<float> partBuf (B);
 
-    const size_t gsz = B;  // one work‑item per sample in a block
+    const size_t gsz = B;  
 
     double kernel_ns = 0.0;
-    const unsigned BLKS_ALL = BLKS_IN + P; // flush tail
+    const unsigned BLKS_ALL = BLKS_IN + P; 
 
-    for(unsigned blk=0; blk<BLKS_ALL; ++blk)
+    for(unsigned blk=0; blk<BLKS_ALL; blk++)
     {
-        /* slide ring: discard oldest L samples, keep the rest */
+        
         std::memmove(ring.data(),
                      ring.data()+L,
                      (RING_SAMPLES - L)*sizeof(float));
 
-        /* bring in new data (or zeros once input exhausted) */
+        
         if(blk < BLKS_IN)
             std::memcpy(ring.data()+ (RING_SAMPLES - L),
                         x.data() + blk*B,
@@ -164,10 +154,10 @@ int main()
         std::fill(blockOut.begin(), blockOut.end(), 0.0f);
 
         const unsigned maxPart = (blk < P)? blk : P-1;
-        for(unsigned part=0; part<=maxPart; ++part)
+        for(unsigned part=0; part<=maxPart; part++)
         {
             const cl_uint partIdx = part;
-            const cl_uint base    = (P - 1 - part)*L;   // offset into ring
+            const cl_uint base    = (P - 1 - part)*L;   
 
             clSetKernelArg(kn,0,sizeof(cl_mem),&dRing);
             clSetKernelArg(kn,1,sizeof(cl_mem),&dH);
@@ -184,12 +174,12 @@ int main()
             kernel_ns += double(te - ts);
             clReleaseEvent(ev);
 
-            /* fetch partial result and accumulate on host */
+            
             clEnqueueReadBuffer(q,dY,CL_TRUE,0,B*sizeof(float),partBuf.data(),0,nullptr,nullptr);
             for(unsigned i=0;i<B;i++) blockOut[i] += partBuf[i];
         }
 
-        /* write finished samples to output */
+        
         const unsigned remaining = OUT_LEN - blk*B;
         const unsigned copyLen   = (remaining < B)? remaining : B;
         std::memcpy(yGPU.data() + blk*B, blockOut.data(), copyLen*sizeof(float));
