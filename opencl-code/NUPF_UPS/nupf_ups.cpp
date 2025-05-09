@@ -13,7 +13,7 @@
 #include <iostream>
 #include <vector>
 
-constexpr std::array<unsigned,3> partLen = {256, 256, 512}; 
+constexpr std::array<unsigned,3> partLen = {128, 256, 549}; 
 constexpr unsigned P         = partLen.size();
 constexpr unsigned FIR_LEN   = partLen[0] + partLen[1] + partLen[2];
 constexpr unsigned B         = partLen[0];                
