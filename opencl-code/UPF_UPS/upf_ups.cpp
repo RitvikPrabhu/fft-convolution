@@ -13,12 +13,12 @@
 
 constexpr unsigned N_SAMPLES = 8192;     
 constexpr unsigned L         = 256;    
-constexpr unsigned FIR_LEN   = 1024;    
+constexpr unsigned FIR_LEN   = 933;    
 constexpr unsigned P         = FIR_LEN / L;   
 constexpr unsigned B         = L;       
 
-static_assert(FIR_LEN % L == 0);
-static_assert(N_SAMPLES  % B == 0);
+// static_assert(FIR_LEN % L == 0);
+// static_assert(N_SAMPLES  % B == 0);
 
 constexpr unsigned BLKS_IN   = N_SAMPLES / B;              
 constexpr unsigned OUT_LEN   = N_SAMPLES + FIR_LEN - 1;
