@@ -1,255 +1,311 @@
-/*  upf_ups.cpp  – minimal‑correct UPS on UPF reference
-
-    compile:  g++ -std=c++17 upf_ups.cpp -lOpenCL -o upf_ups
-*/
-#define  CL_TARGET_OPENCL_VERSION 120
-#define  _POSIX_C_SOURCE 199309L
+#define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
+#include <clFFT.h>
 
-#include <cmath>
-#ifndef M_PI
-#  define M_PI 3.14159265358979323846
-#endif
-#include <complex>
-#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <stdexcept>
+#include <cmath>
+#include <algorithm>
 
-// ---------------------------------------------------------------------------
-// problem parameters  (unchanged B & L, FIR extended so that P = 4)
-// ---------------------------------------------------------------------------
-constexpr unsigned N_SAMPLES = 8192;      // input length
-constexpr unsigned B         = 1024;      // block length   (signal partition)
-constexpr unsigned L         = 256;       // sub‑filter len (filter partition)
-constexpr unsigned FIR_LEN   = 1024;      // full FIR taps   →  P = 4
-constexpr unsigned K         = 2*B;       // FFT size (power‑of‑two ≥ B+L‑1)
+// -----------------------------------------------------------------------------
+// Tunables
+// -----------------------------------------------------------------------------
+static constexpr size_t BLOCK_LEN = 1024;                 // B
+static constexpr size_t TRANSFORM_LEN = BLOCK_LEN * 2;    // K = 2B (power‑of‑two)
 
-static_assert(FIR_LEN % L   == 0);
-static_assert((K & (K-1))   == 0);        // power of two
-
-constexpr unsigned P        = FIR_LEN / L;          // # filter partitions
-constexpr unsigned Kc       = K/2 + 1;               // # unique complex bins
-constexpr unsigned BLKS_IN  = (N_SAMPLES + B - 1)/B; // = 8
-constexpr unsigned OUT_LEN  = N_SAMPLES + FIR_LEN - 1;
-
-// ---------------------------------------------------------------------------
-//  tiny header‑only radix‑2 FFT  (recursive, O(N log N), single‑precision)
-// ---------------------------------------------------------------------------
-using cpx = std::complex<float>;
-
-void cpuFFT(std::vector<cpx>& a, bool inverse = false)
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+static std::vector<float> readBinary(const char* fn)
 {
-    const size_t n = a.size();
-    if (n == 1) return;
+    std::ifstream f(fn, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error(std::string("Cannot open ") + fn);
+    std::streamsize sz = f.tellg();
+    if (sz % sizeof(float) != 0)
+        throw std::runtime_error("Size of " + std::string(fn) + " not multiple of 4");
+    std::vector<float> data(sz / sizeof(float));
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(data.data()), sz);
+    return data;
+}
 
-    std::vector<cpx> a0(n/2), a1(n/2);
-    for (size_t i = 0; i < n/2; ++i) {
-        a0[i] = a[2*i];
-        a1[i] = a[2*i+1];
+static void writeBinary(const char* fn, const std::vector<float>& data)
+{
+    std::ofstream f(fn, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
+}
+
+#define CLCHK(x) do { cl_int err_ = (x); if (err_ != CL_SUCCESS) { \
+    std::cerr << "OpenCL error " << err_ << " at " << __LINE__ << std::endl; std::exit(EXIT_FAILURE);} } while(0)
+
+// -----------------------------------------------------------------------------
+// OpenCL helpers – pick default platform/device, build kernels
+// -----------------------------------------------------------------------------
+static cl_context createContext(cl_device_id& dev)
+{
+    cl_uint numPlatforms = 0;
+    CLCHK(clGetPlatformIDs(0, nullptr, &numPlatforms));
+    std::vector<cl_platform_id> plats(numPlatforms);
+    CLCHK(clGetPlatformIDs(numPlatforms, plats.data(), nullptr));
+    for (auto p : plats)
+    {
+        cl_uint numDevs = 0;
+        CLCHK(clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevs));
+        if (!numDevs) continue;
+        std::vector<cl_device_id> devs(numDevs);
+        CLCHK(clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, numDevs, devs.data(), nullptr));
+        dev = devs[0];
+        cl_int err;
+        cl_context ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
+        CLCHK(err);
+        return ctx;
     }
-    cpuFFT(a0, inverse);
-    cpuFFT(a1, inverse);
-
-    const float ang = 2.0f*M_PI/n * (inverse ? -1.0f : 1.0f);
-    cpx w(1.0f,0.0f), wn(std::cos(ang), std::sin(ang));
-    for (size_t k = 0; k < n/2; ++k) {
-        cpx t = w * a1[k];
-        a[k]        = a0[k] + t;
-        a[k + n/2]  = a0[k] - t;
-        w *= wn;
-    }
-    if (inverse)          // normalise
-        for (auto& v : a) v /= 2.0f;
-}
-// helper that takes/returns separate real array -----------------------------
-void fftRealToSpec(const float* xin, std::vector<cpx>& X)
-{
-    X.assign(K, cpx(0,0));
-    for (size_t i=0;i<K && i<B;++i) X[i] = xin[i];     // copy & zero‑pad
-    cpuFFT(X,false);
-}
-void ifftSpecToReal(std::vector<cpx>& X, float* xout)
-{
-    cpuFFT(X,true);                                   // inverse
-    for (size_t i=0;i<B;++i) xout[i] = X[i+B].real(); // keep right half
+    throw std::runtime_error("No GPU device found");
 }
 
-// ---------------------------------------------------------------------------
-//  helper I/O
-// ---------------------------------------------------------------------------
-static void dump(const char* fn,const std::vector<float>& v)
+static cl_command_queue createQueue(cl_context ctx, cl_device_id dev)
 {
-    std::ofstream(fn,std::ios::binary)
-        .write(reinterpret_cast<const char*>(v.data()), v.size()*sizeof(float));
+#if defined(CL_VERSION_2_0)
+    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, nullptr, nullptr);
+#else
+    cl_command_queue q = clCreateCommandQueue(ctx, dev, 0, nullptr);
+#endif
+    return q;
 }
 
-// ---------------------------------------------------------------------------
-//  OpenCL kernel:  sum_{p=0}^{P-1}   FDL[(head+p)%P][k] * H[p][k]
-//                  one work‑item per k   (0 … Kc-1)
-// ---------------------------------------------------------------------------
-static const char* kSrc = R"CLC(
-typedef struct{float x; float y;} cpx;
-
-inline cpx  mul(const cpx a, const cpx b)
+static const char* kernelSrc = R"CLC(
+// Complex numbers are stored as float2 (x = real, y = imag)
+__kernel void cmul_acc(__global const float2* __restrict X,
+                       __global const float2* __restrict H,
+                       __global float2* Y,
+                       int first)
 {
-    return (cpx)(a.x*b.x - a.y*b.y,  a.x*b.y + a.y*b.x);
-}
-__kernel
-void accumulate(__global const cpx*  FDL,     // P * Kc
-                __global const cpx*  H,       // P * Kc
-                __global       cpx*  Y,       // Kc
-                const uint P,
-                const uint Kc,
-                const uint head)
-{
-    uint k = get_global_id(0);
-    cpx sum = (cpx)(0.0f,0.0f);
-    uint idx = head;
-    for(uint p=0; p<P; ++p){
-        cpx a = FDL[idx*Kc + k];
-        cpx b = H  [p  *Kc + k];
-        sum += mul(a,b);
-        idx = (idx + 1) % P;       // next (older) spectrum
-    }
-    Y[k] = sum;
+    const int gid = get_global_id(0);
+    float2 a = X[gid];
+    float2 b = H[gid];
+    float2 prod = (float2)(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
+    if (first)
+        Y[gid] = prod;
+    else
+        Y[gid] += prod;
 }
 )CLC";
 
-// ---------------------------------------------------------------------------
+static cl_program buildProgram(cl_context ctx, cl_device_id dev, const char* src)
+{
+    size_t len = std::strlen(src);
+    const char* buf = src;
+    cl_int err;
+    cl_program prog = clCreateProgramWithSource(ctx, 1, &buf, &len, &err);
+    CLCHK(err);
+    err = clBuildProgram(prog, 1, &dev, "-cl-fast-relaxed-math", nullptr, nullptr);
+    if (err != CL_SUCCESS)
+    {
+        size_t logsz = 0;
+        clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logsz);
+        std::string log(logsz, '\0');
+        clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, logsz, log.data(), nullptr);
+        std::cerr << log << std::endl;
+        throw std::runtime_error("Failed to build program");
+    }
+    return prog;
+}
 
+// -----------------------------------------------------------------------------
+// Main processing – Uniform Partitioned Overlap‑Save convolution
+// -----------------------------------------------------------------------------
 int main()
 {
-    // -----------------------------------------------------------------------
-    // 1.  create signal and FIR
-    // -----------------------------------------------------------------------
-    std::vector<float> x(N_SAMPLES);
-    for(unsigned n=0;n<N_SAMPLES;++n)
-        x[n] = std::sin(2.0f*M_PI*100.0f*n/float(N_SAMPLES));
+    try {
+        std::vector<float> x = readBinary("input.bin");
+        std::vector<float> h = readBinary("fir.bin");
+        const size_t M = x.size();
+        const size_t N = h.size();
+        const size_t P = (N + BLOCK_LEN - 1) / BLOCK_LEN;   // partitions
+        const size_t totalBlocks = (M + BLOCK_LEN - 1) / BLOCK_LEN;
 
-    std::vector<float> h(FIR_LEN);
-    {   // Hann‑windowed sinc LPF  (fc = 500 Hz @ 8 kHz  → 0.0625 f_Nyq)
-        const float fc = 500.0f/8000.0f;                // norm. cut‑off
-        const float M  = FIR_LEN - 1.0f;
-        for(unsigned n=0;n<FIR_LEN;++n){
-            float w  = 0.5f*(1.0f-std::cos(2.0f*M_PI*n/M));
-            float t  = n - M/2.0f;
-            float si = (t==0.0f) ? 1.0f
-                                 : std::sin(2.0f*M_PI*fc*t)/(M_PI*t);
-            h[n] = w*si;
+        // ------------------------------------------------------------------
+        // OpenCL setup
+        // ------------------------------------------------------------------
+        cl_device_id dev = nullptr;
+        cl_context ctx = createContext(dev);
+        cl_command_queue q = createQueue(ctx, dev);
+        cl_program prog = buildProgram(ctx, dev, kernelSrc);
+        cl_kernel k_cmul_acc = clCreateKernel(prog, "cmul_acc", nullptr);
+
+        // ------------------------------------------------------------------
+        // clFFT setup (single‑precision, in‑place complex‑interleaved)
+        // ------------------------------------------------------------------
+        clfftSetupData fftSetup;
+        clfftInitSetupData(&fftSetup);
+        clfftSetup(&fftSetup);
+
+        clfftPlanHandle planFwd, planInv;
+        size_t lengths[1] = { TRANSFORM_LEN };
+        clfftCreateDefaultPlan(&planFwd, ctx, CLFFT_1D, lengths);
+        clfftSetPlanPrecision(planFwd, CLFFT_SINGLE);
+        clfftSetLayout(planFwd, CLFFT_REAL, CLFFT_HERMITIAN_INTERLEAVED);
+        clfftSetResultLocation(planFwd, CLFFT_OUTOFPLACE);
+        clfftBakePlan(planFwd, 1, &q, nullptr, nullptr);
+
+        clfftCreateDefaultPlan(&planInv, ctx, CLFFT_1D, lengths);
+        clfftSetPlanPrecision(planInv, CLFFT_SINGLE);
+        clfftSetLayout(planInv, CLFFT_HERMITIAN_INTERLEAVED, CLFFT_REAL);
+        clfftSetResultLocation(planInv, CLFFT_OUTOFPLACE);
+        float invScale = 1.0f / static_cast<float>(TRANSFORM_LEN);
+        clfftSetPlanScale(planInv, CLFFT_BACKWARD, invScale);
+        clfftBakePlan(planInv, 1, &q, nullptr, nullptr);
+
+        // ------------------------------------------------------------------
+        // Device buffers
+        // ------------------------------------------------------------------
+        size_t spectralElems = TRANSFORM_LEN / 2 + 1;  // real→hermitian length
+        size_t spectralBytes = spectralElems * sizeof(cl_float2);
+
+        // Filter spectra (P × spectralElems)
+        std::vector<cl_mem> d_H(P);
+        // Host temporary buffers
+        std::vector<float> hostTD(TRANSFORM_LEN, 0.0f);
+        std::vector<float> hostTD_out(TRANSFORM_LEN);
+
+        // Create accumulator spectrum buffer
+        cl_mem d_Y = clCreateBuffer(ctx, CL_MEM_READ_WRITE, spectralBytes, nullptr, nullptr);
+
+        // Input spectrum FDL (P slots)
+        std::vector<cl_mem> d_Xfdl(P);
+        for (size_t i = 0; i < P; ++i)
+        {
+            d_Xfdl[i] = clCreateBuffer(ctx, CL_MEM_READ_WRITE, spectralBytes, nullptr, nullptr);
         }
+
+        // Temporary in/out buffers for clFFT (each transform allocates its own)
+        cl_mem d_in = clCreateBuffer(ctx, CL_MEM_READ_WRITE, TRANSFORM_LEN * sizeof(float), nullptr, nullptr);
+        cl_mem d_spec = clCreateBuffer(ctx, CL_MEM_READ_WRITE, spectralBytes, nullptr, nullptr);
+        cl_mem d_td   = clCreateBuffer(ctx, CL_MEM_READ_WRITE, TRANSFORM_LEN * sizeof(float), nullptr, nullptr);
+
+        // ------------------------------------------------------------------
+        // Pre‑compute filter partition spectra
+        // ------------------------------------------------------------------
+        for (size_t p = 0; p < P; ++p)
+        {
+            std::fill(hostTD.begin(), hostTD.end(), 0.0f);
+            size_t base = p * BLOCK_LEN;
+            size_t copy = std::min(BLOCK_LEN, N - base);
+            std::memcpy(hostTD.data(), h.data() + base, copy * sizeof(float));
+            // Upload real data
+            CLCHK(clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, TRANSFORM_LEN * sizeof(float), hostTD.data(), 0, nullptr, nullptr));
+            // Fwd FFT (real→Hermitian)
+            cl_mem inbufs[1]  = { d_in };
+            cl_mem outbufs[1] = { d_spec };
+            CLCHK(clfftEnqueueTransform(planFwd, CLFFT_FORWARD, 1, &q, 0, nullptr, nullptr, inbufs, outbufs, nullptr));
+            CLCHK(clFinish(q));
+            // Allocate buffer and copy spectrum into permanent storage
+            d_H[p] = clCreateBuffer(ctx, CL_MEM_READ_WRITE, spectralBytes, nullptr, nullptr);
+            CLCHK(clEnqueueCopyBuffer(q, d_spec, d_H[p], 0, 0, spectralBytes, 0, nullptr, nullptr));
+        }
+
+        // ------------------------------------------------------------------
+        // Streaming convolution loop (overlap‑save)
+        // ------------------------------------------------------------------
+        size_t outLen = M + N - 1;
+        std::vector<float> y(outLen, 0.0f);
+        size_t writePos = 0;
+        size_t ringHead = 0;  // index of newest spectrum in FDL
+
+        size_t blocksToProcess = totalBlocks + P;  // flush tail with zeros
+        size_t srcPos = 0;
+        for (size_t blk = 0; blk < blocksToProcess; ++blk)
+        {
+            // Prepare time‑domain window of K samples (sliding)
+            // Shift left by BLOCK_LEN
+            std::move(hostTD.begin() + BLOCK_LEN, hostTD.end(), hostTD.begin());
+            // Fill rightmost B with new samples or zeros if finished
+            size_t samplesLeft = (srcPos < M) ? std::min(BLOCK_LEN, M - srcPos) : 0;
+            if (samplesLeft)
+                std::memcpy(hostTD.data() + (TRANSFORM_LEN - BLOCK_LEN), x.data() + srcPos, samplesLeft * sizeof(float));
+            std::fill(hostTD.begin() + (TRANSFORM_LEN - BLOCK_LEN) + samplesLeft, hostTD.end(), 0.0f);
+            srcPos += samplesLeft;
+
+            // Upload window
+            CLCHK(clEnqueueWriteBuffer(q, d_in, CL_TRUE, 0, TRANSFORM_LEN * sizeof(float), hostTD.data(), 0, nullptr, nullptr));
+            // Forward FFT
+            cl_mem inbufs[1]  = { d_in };
+            cl_mem outbufs[1] = { d_spec };
+            CLCHK(clfftEnqueueTransform(planFwd, CLFFT_FORWARD, 1, &q, 0, nullptr, nullptr, inbufs, outbufs, nullptr));
+            CLCHK(clFinish(q));
+
+            // Store spectrum in FDL slot ringHead (overwrite old)
+            CLCHK(clEnqueueCopyBuffer(q, d_spec, d_Xfdl[ringHead], 0, 0, spectralBytes, 0, nullptr, nullptr));
+
+            // Zero accumulator Y in device (lazy – first=1 will overwrite anyway)
+
+            // Loop over filter partitions
+            for (size_t p = 0; p < P; ++p)
+            {
+                size_t delayBlocks = p;
+                size_t slot = (ringHead + P - delayBlocks) % P; // find spectrum delayed by p blocks
+                int first = (p == 0) ? 1 : 0;
+
+                // Set kernel args
+                CLCHK(clSetKernelArg(k_cmul_acc, 0, sizeof(cl_mem), &d_Xfdl[slot]));
+                CLCHK(clSetKernelArg(k_cmul_acc, 1, sizeof(cl_mem), &d_H[p]));
+                CLCHK(clSetKernelArg(k_cmul_acc, 2, sizeof(cl_mem), &d_Y));
+                CLCHK(clSetKernelArg(k_cmul_acc, 3, sizeof(int), &first));
+
+                size_t gsz = spectralElems;
+                CLCHK(clEnqueueNDRangeKernel(q, k_cmul_acc, 1, nullptr, &gsz, nullptr, 0, nullptr, nullptr));
+            }
+            CLCHK(clFinish(q));
+
+            // Inverse FFT (Hermitian→real)
+            cl_mem inv_in[1]  = { d_Y };
+            cl_mem inv_out[1] = { d_td }; // length K real out
+            CLCHK(clfftEnqueueTransform(planInv, CLFFT_BACKWARD, 1, &q, 0, nullptr, nullptr, inv_in, inv_out, nullptr));
+            CLCHK(clFinish(q));
+
+            // Download and copy last B samples to output
+            CLCHK(clEnqueueReadBuffer(q, d_td, CL_TRUE, 0, TRANSFORM_LEN * sizeof(float), hostTD_out.data(), 0, nullptr, nullptr));
+
+            if (writePos < y.size())
+            {
+                size_t canWrite = std::min(BLOCK_LEN, y.size() - writePos);
+                std::memcpy(y.data() + writePos, hostTD_out.data() + (TRANSFORM_LEN - BLOCK_LEN), canWrite * sizeof(float));
+                writePos += canWrite;
+            }
+
+            // Advance ring head pointer
+            ringHead = (ringHead + P - 1) % P; // move backwards so that slot mapping works
+        }
+
+        // ------------------------------------------------------------------
+        // Write to gpu.bin for the Python checker
+        // ------------------------------------------------------------------
+        writeBinary("gpu.bin", y);
+
+        // Cleanup
+        clfftDestroyPlan(&planFwd);
+        clfftDestroyPlan(&planInv);
+        clfftTeardown();
+        clReleaseKernel(k_cmul_acc);
+        clReleaseProgram(prog);
+        for (auto b : d_H) clReleaseMemObject(b);
+        for (auto b : d_Xfdl) clReleaseMemObject(b);
+        clReleaseMemObject(d_Y);
+        clReleaseMemObject(d_in);
+        clReleaseMemObject(d_spec);
+        clReleaseMemObject(d_td);
+        clReleaseCommandQueue(q);
+        clReleaseContext(ctx);
+
+        std::cout << "GPU convolution written to gpu.bin (" << y.size() << " samples)" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return EXIT_FAILURE;
     }
-    dump("input.bin", x);  dump("fir.bin", h);
-
-    // -----------------------------------------------------------------------
-    // 2.  pre‑compute sub‑filter spectra   H[p][k]   (host)
-    // -----------------------------------------------------------------------
-    std::vector<cpx> Hspec(P*Kc);
-    for (unsigned p=0; p<P; ++p) {
-        std::vector<cpx> tmp(K, cpx(0,0));
-        std::copy(h.begin()+p*L, h.begin()+p*L+L, tmp.begin()); // zero‑pad
-        cpuFFT(tmp,false);
-        for (unsigned k=0;k<Kc;++k)
-            Hspec[p*Kc + k] = tmp[k];
-    }
-
-    // -----------------------------------------------------------------------
-    // 3.  OpenCL set‑up
-    // -----------------------------------------------------------------------
-    cl_int err; cl_platform_id plat; cl_device_id dev;
-    clGetPlatformIDs(1,&plat,nullptr);
-    clGetDeviceIDs  (plat,CL_DEVICE_TYPE_DEFAULT,1,&dev,nullptr);
-
-    cl_context ctx  = clCreateContext(nullptr,1,&dev,nullptr,nullptr,&err);
-    cl_command_queue q =
-        clCreateCommandQueue(ctx,dev,CL_QUEUE_PROFILING_ENABLE,&err);
-
-    cl_program pr = clCreateProgramWithSource(ctx,1,&kSrc,nullptr,&err);
-    clBuildProgram(pr,1,&dev,"",nullptr,nullptr);
-    cl_kernel  kn = clCreateKernel (pr,"accumulate",&err);
-
-    // device buffers --------------------------------------------------------
-    const size_t bytesSpec = Kc * sizeof(cpx);
-    cl_mem dFDL  = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                  P*bytesSpec, nullptr, &err);
-    cl_mem dH    = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
-                                  P*bytesSpec, nullptr, &err);
-    cl_mem dY    = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                  bytesSpec,  nullptr, &err);
-    // upload constant filter spectra
-    clEnqueueWriteBuffer(q,dH,CL_TRUE,0,P*bytesSpec,Hspec.data(),0,nullptr,nullptr);
-
-    // set static kernel args
-    clSetKernelArg(kn,0,sizeof(cl_mem), &dFDL);
-    clSetKernelArg(kn,1,sizeof(cl_mem), &dH);
-    clSetKernelArg(kn,2,sizeof(cl_mem), &dY);
-    clSetKernelArg(kn,3,sizeof(cl_uint),&P);
-    clSetKernelArg(kn,4,sizeof(cl_uint),&Kc);
-
-    // -----------------------------------------------------------------------
-    // 4.  streaming convolution
-    // -----------------------------------------------------------------------
-    std::vector<float> y(OUT_LEN, 0.0f);
-    std::vector<cpx>   Xspec(K);      // host: current block spectrum
-    std::vector<cpx>   Yspec(K);      // host: accumulated spectrum
-
-    unsigned head = 0;                // FDL newest slot
-    double kernel_ns = 0.0;
-
-    const size_t gsz = Kc;            // one WI per spectral bin
-    for (unsigned blk = 0; blk < BLKS_IN; ++blk)
-    {
-        // ---- 4.1  FFT of current block -----------------------------------
-        float inBlock[B] = {0};
-        const unsigned blkSamples = std::min<unsigned>(B,
-                                    N_SAMPLES - blk*B);
-        std::memcpy(inBlock, x.data()+blk*B, blkSamples*sizeof(float));
-        fftRealToSpec(inBlock, Xspec);          // → Xspec[0 … K-1]
-
-        // ---- 4.2  update FDL (newest spectra at 'head') -------------------
-        clEnqueueWriteBuffer(q, dFDL, CL_TRUE,
-                             head*bytesSpec, bytesSpec,
-                             Xspec.data(), 0,nullptr,nullptr);
-
-        // ---- 4.3  launch accumulate kernel -------------------------------
-        clSetKernelArg(kn,5,sizeof(cl_uint), &head);
-
-        cl_event ev;
-        clEnqueueNDRangeKernel(q, kn, 1, nullptr, &gsz, nullptr,
-                               0,nullptr,&ev);
-        clWaitForEvents(1,&ev);
-        cl_ulong ts,te;
-        clGetEventProfilingInfo(ev,CL_PROFILING_COMMAND_START,sizeof(ts),&ts,nullptr);
-        clGetEventProfilingInfo(ev,CL_PROFILING_COMMAND_END  ,sizeof(te),&te,nullptr);
-        kernel_ns += double(te-ts);
-        clReleaseEvent(ev);
-
-        // ---- 4.4  read spectrum → IFFT → save right half ------------------
-        clEnqueueReadBuffer(q,dY,CL_TRUE,0,bytesSpec,
-                            Yspec.data(),0,nullptr,nullptr);
-        // rebuild the conjugate half (Hermitian)
-        for(unsigned k=1;k<Kc-1;++k)
-            Yspec[K-k] = std::conj(Yspec[k]);
-        ifftSpecToReal(Yspec, inBlock);         // reuse inBlock as temp
-        std::memcpy(y.data()+blk*B, inBlock, B*sizeof(float));
-
-        // ---- 4.5 advance head  (circular) --------------------------------
-        head = (head == 0) ? (P-1) : (head-1);
-    }
-
-    dump("gpu.bin", y);
-    std::cout << "GPU complex‑MAC time: "
-              << kernel_ns*1e-6 << " ms  ("
-              << kernel_ns*1e-3/BLKS_IN << " µs/block)\n";
-
-    // -----------------------------------------------------------------------
-    // 5.  tidy up
-    // -----------------------------------------------------------------------
-    clReleaseMemObject(dFDL);  clReleaseMemObject(dH);  clReleaseMemObject(dY);
-    clReleaseKernel(kn);       clReleaseProgram(pr);
-    clReleaseCommandQueue(q);  clReleaseContext(ctx);
-
-    std::cout << "done – binaries written.  Run python3 check_conv.py\n";
-    return 0;
+    return EXIT_SUCCESS;
 }
